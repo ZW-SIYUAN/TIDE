@@ -1,0 +1,51 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+.venv/
+env/
+venv/
+
+# ── Data files (do not commit raw/synthetic datasets) ─────────────────────────
+data/
+*.csv
+
+# ── Experiment outputs ────────────────────────────────────────────────────────
+# All output_* directories contain generated data, checkpoints, and plots
+output_*/
+
+# Individual artefacts that may live at repo root during development
+*.png
+*.jpg
+*.jpeg
+*.json
+*.pt
+*.bin
+*.safetensors
+
+# Keep CHANGELOG.md (it is a tracked doc, not an output artefact)
+!CHANGELOG.md
+
+# ── HuggingFace / Trainer checkpoints ────────────────────────────────────────
+checkpoint-*/
+runs/
+trainer_*/
+trainer_ib_sparse*/
+test_ib_great_output*/
+
+# ── GeoJSON cache (downloaded at runtime by plot_scatter_synthetic.py) ────────
+us_states_boundaries.json
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── OS / IDE ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

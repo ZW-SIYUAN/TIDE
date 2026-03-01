@@ -1,5 +1,6 @@
 """
 IB-SparseAttention: Information Bottleneck Sparse Attention Framework for be-great
+v0.2 -- atomic_tokenizer plug-in support added (see CHANGELOG.md)
 
 This module extends the GReaT (be-great) library with an "IB-SparseAttention" framework
 that uses Information Bottleneck (IB) principles to automatically learn sparse feature
@@ -30,6 +31,7 @@ References:
 """
 
 import math
+import os
 import random
 import logging
 import typing as tp
@@ -779,9 +781,17 @@ class IBSparseTrainer(GReaTTrainer):
         else:
             ib_loss = torch.tensor(0.0, device=ce_loss.device)
 
-        # ── L1 sparsity regularisation on W ───────────────────────────────
+        # ── L1 sparsity regularisation on W (off-diagonal only) ───────────
+        # The diagonal W[i,i] controls within-feature self-attention — features
+        # MUST be able to attend to their own preceding structural tokens
+        # (e.g., "lat is" when generating the lat value).  Penalising the
+        # diagonal suppresses this pathway and causes NaN outputs for numeric
+        # columns.  Only off-diagonal entries are regularised.
         if not self.freeze_W:
-            l1_loss = self.lambda_sparse * self.W.abs().sum()
+            off_diag_mask = 1.0 - torch.eye(
+                self.W.shape[0], device=self.W.device, dtype=self.W.dtype
+            )
+            l1_loss = self.lambda_sparse * (self.W * off_diag_mask).abs().sum()
             total_loss = total_loss + l1_loss
         else:
             l1_loss = torch.tensor(0.0, device=ce_loss.device)
@@ -858,7 +868,6 @@ def log_W_statistics(
                 import matplotlib
                 matplotlib.use("Agg")
                 import matplotlib.pyplot as plt
-                import os
 
                 fig, ax = plt.subplots(figsize=(max(6, m), max(5, m)))
                 im = ax.imshow(W_pos, aspect="auto", cmap="viridis")
@@ -916,10 +925,11 @@ class IBSparseGReaT(GReaT):
         Train LoRA + W simultaneously with IB loss enabled.
         W learns which features statistically depend on each other.
 
-    Phase 2 — Autonomous Ordering:
-        Extract W, build a directed graph with networkx.
-        Use Edmonds' maximum spanning arborescence to break cycles and
-        output a stable topological feature ordering (optimal_order).
+    Phase 2 — Autonomous Ordering (Entropy-Directed):
+        Extract W, apply bimodal gap thresholding to identify active edges.
+        Apply cardinality-based asymmetric masking: if nunique[i] >> nunique[j],
+        suppress the reverse edge j→i (high entropy → low entropy is the only
+        physically valid causal direction).  Condense SCCs → topological sort.
 
     Phase 3 — Structured Fine-Tuning (fixed feature order):
         Freeze W.  Fine-tune LoRA only with optimal_order fixed.
@@ -932,8 +942,11 @@ class IBSparseGReaT(GReaT):
         w_lr: Learning rate for the W matrix (separate from LoRA lr).
         phase1_epochs: Epochs for Phase 1.
         phase3_epochs: Epochs for Phase 3 fine-tuning (Phase 2 is analysis-only).
-        arborescence_root: Feature index to use as the root of the spanning
-            arborescence.  Defaults to 0.
+        cardinality_ratio_threshold: Ratio of nunique values above which the
+            direction of a bidirectional edge is enforced.  When
+            nunique[i] / nunique[j] > ratio, the reverse edge j→i is suppressed
+            (high-entropy → low-entropy is the only valid causal direction).
+            Default 10.0.  Set to inf to disable.
         save_heatmaps: Whether to save W heatmap PNGs during training.
         quantization: Base model quantisation level.  One of:
             - None   : full precision (default)
@@ -948,12 +961,21 @@ class IBSparseGReaT(GReaT):
         self,
         llm: str,
         *,
+        # ── Plug-in modules (v0.2) ───────────────────────────────────────────
+        # atomizer: CategoricalAtomizer instance or None.
+        # When set, multi-token categorical values are replaced with single
+        # atomic special tokens before training, eliminating token-prefix
+        # competition (e.g. "Northern Cardinal" vs "Northern Mockingbird").
+        # Pass atomizer=None (default) to reproduce vanilla GReaT behaviour
+        # and use as ablation baseline.
+        atomizer=None,   # atomic_tokenizer.CategoricalAtomizer | None
+        # ── IB hyper-parameters ──────────────────────────────────────────────
         beta_ib: float = 0.1,
         lambda_sparse: float = 1e-3,
         w_lr: float = 1e-2,
         phase1_epochs: int = 10,
         phase3_epochs: int = 5,
-        arborescence_root: int = 0,
+        cardinality_ratio_threshold: float = 10.0,
         save_heatmaps: bool = False,
         heatmap_dir: str = "W_heatmaps",
         quantization: tp.Optional[str] = None,   # None | "4bit" | "8bit"
@@ -995,7 +1017,7 @@ class IBSparseGReaT(GReaT):
         self.w_lr = w_lr
         self.phase1_epochs = phase1_epochs
         self.phase3_epochs = phase3_epochs
-        self.arborescence_root = arborescence_root
+        self.cardinality_ratio_threshold = cardinality_ratio_threshold
         self.save_heatmaps = save_heatmaps
         self.heatmap_dir = heatmap_dir
 
@@ -1006,6 +1028,11 @@ class IBSparseGReaT(GReaT):
 
         # Populated after Phase 2
         self.optimal_order: tp.Optional[tp.List[int]] = None
+        # Populated in fit() — used by Phase 2 for direction enforcement
+        self.nunique_dict: tp.Optional[tp.Dict[str, int]] = None
+
+        # ── Plug-in modules (v0.2) ───────────────────────────────────────────
+        self.atomizer = atomizer   # CategoricalAtomizer | None
 
     # ── Quantised model loading ───────────────────────────────────────────
 
@@ -1031,14 +1058,27 @@ class IBSparseGReaT(GReaT):
                 "transformers.  Install with:  pip install bitsandbytes"
             )
 
+        # Determine best compute dtype: prefer bf16 on sm_80+ (Ampere/Hopper/Blackwell)
+        # bf16 has fp32-equivalent dynamic range, avoids loss-scaling, and has native
+        # Tensor Core support on RTX 3090 / A100 / H100 / RTX 5080 and newer.
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            _compute_dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
+        else:
+            _compute_dtype = torch.bfloat16  # CPU/MPS default
+
         if quantization == "8bit":
-            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+            bnb_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                # int8 uses bf16/fp16 only for non-quantised layers
+                llm_int8_threshold=6.0,
+            )
         elif quantization == "4bit":
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",       # NormalFloat4 — best quality
-                bnb_4bit_use_double_quant=True,  # nested quantisation (saves ~0.4 bpw)
-                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",          # NormalFloat4 — best quality
+                bnb_4bit_use_double_quant=True,     # nested quant saves ~0.4 bpw
+                bnb_4bit_compute_dtype=_compute_dtype,  # bf16 on sm_80+, fp16 otherwise
             )
         else:
             raise ValueError(f"Unknown quantization level: {quantization!r}")
@@ -1055,14 +1095,20 @@ class IBSparseGReaT(GReaT):
     def _init_W(self, num_features: int) -> None:
         """Initialise W ∈ R^{m×m} in fp32 on the model's device.
 
-        Initialised to 0 so that softplus(0) = ln(2) ≈ 0.693 and
-        log(softplus(0) + ε) ≈ log(0.693) ≈ -0.37, giving a slight
-        suppression bias that is quickly overridden by gradients.
+        Off-diagonal entries start at 0 (softplus(0) ≈ 0.693 → small suppression
+        bias) and are shaped by IB + L1 gradients during Phase 1.
+
+        Diagonal entries W[i,i] start at 3.0 (softplus(3) ≈ 3.05 → positive
+        attention bias) so features can always attend to their own preceding
+        structural tokens (e.g., "lat is" when generating the lat value).
+        The diagonal is exempt from L1 regularisation (see compute_loss).
         """
         device = next(self.model.parameters()).device
         W_data = torch.zeros(num_features, num_features, dtype=torch.float32, device=device)
-        # Small random perturbation for symmetry breaking
+        # Small random perturbation for symmetry breaking (off-diagonal only)
         W_data += torch.randn_like(W_data) * 0.01
+        # Diagonal: initialise high so within-feature attention is open from the start
+        W_data.fill_diagonal_(3.0)
         self.W = nn.Parameter(W_data, requires_grad=True)
         self.modulator = IBSparseAttentionModulator(
             W=self.W,
@@ -1097,20 +1143,33 @@ class IBSparseGReaT(GReaT):
 
         return torch.optim.AdamW(param_groups, eps=1e-8)
 
-    # ── Phase 2: Graph analysis & topological sort ────────────────────────
+    # ── Phase 2: Entropy-directed graph analysis & topological sort ──────
 
     def _derive_optimal_order(self) -> tp.List[int]:
-        """Extract feature ordering from W via Maximum Spanning Arborescence.
+        """Extract feature ordering from W using entropy-directed Phase 2.
 
-        Steps:
-          1. Soft-threshold W to extract a dense weight matrix.
-          2. Build a directed weighted graph in networkx.
-          3. Find the Maximum Spanning Arborescence (Edmonds' algorithm)
-             rooted at arborescence_root — breaks all cycles.
-          4. Topological sort of the arborescence gives optimal_order.
+        Algorithm
+        ---------
+        1. Bimodal gap detection — find the natural threshold separating
+           suppressed edges (~0) from active edges (~25) in the W matrix.
+        2. Cardinality-based asymmetric masking — for every active
+           bidirectional pair (i, j):
+             - if nunique[i] / nunique[j] > cardinality_ratio_threshold,
+               the physical direction MUST be i→j (high entropy → low
+               entropy), so the reverse edge j→i is zeroed out.
+             - if the ratio is < 1/threshold, the direction is j→i instead.
+             - if cardinalities are similar, both directions are kept and
+               the cycle is resolved by SCC condensation.
+        3. Build a directed graph with the masked active edges.
+        4. Strongly Connected Component (SCC) condensation — contract cycles
+           into super-nodes to form a DAG.
+        5. Topological sort of the condensed DAG.
+        6. Flatten: for features within the same SCC (ambiguous direction),
+           sort internally by decreasing cardinality (higher entropy first).
 
-        Returns:
-            List of feature indices in optimal generation order.
+        Returns
+        -------
+        List of feature indices in optimal generation order.
         """
         try:
             import networkx as nx
@@ -1121,56 +1180,150 @@ class IBSparseGReaT(GReaT):
 
         assert self.W is not None, "W must be initialised before Phase 2."
 
+        col_names: tp.List[str] = list(self.columns or [])
         with torch.no_grad():
             W_pos = F.softplus(self.W.float()).cpu().numpy()
-
         m = W_pos.shape[0]
 
-        # ── Build directed graph (edge i→j weighted by W_pos[i,j]) ────────
+        # ── Step 1: Bimodal gap threshold ──────────────────────────────────
+        off_diag = np.array(
+            [W_pos[i, j] for i in range(m) for j in range(m) if i != j]
+        )
+        sorted_vals = np.sort(off_diag)
+        gaps = np.diff(sorted_vals)
+        split_idx = int(np.argmax(gaps))
+        threshold = float(
+            (sorted_vals[split_idx] + sorted_vals[split_idx + 1]) / 2.0
+        )
+        n_active = int((off_diag > threshold).sum())
+        logger.info(
+            f"Phase 2: bimodal threshold={threshold:.4f}, "
+            f"active edges={n_active}/{len(off_diag)}"
+        )
+
+        # ── Step 2: Cardinality-based asymmetric masking ───────────────────
+        W_masked = W_pos.copy()
+        nunique: tp.Optional[np.ndarray] = None
+
+        if (
+            self.nunique_dict is not None
+            and len(self.nunique_dict) == m
+            and self.cardinality_ratio_threshold < float("inf")
+        ):
+            nunique = np.array(
+                [self.nunique_dict.get(c, 1) for c in col_names], dtype=float
+            )
+            ratio_thresh = self.cardinality_ratio_threshold
+            cuts = 0
+
+            for i in range(m):
+                for j in range(i + 1, m):
+                    # Only examine pairs where at least one direction is active
+                    if W_pos[i, j] <= threshold and W_pos[j, i] <= threshold:
+                        continue
+
+                    ratio = nunique[i] / (nunique[j] + 1e-8)
+
+                    if ratio > ratio_thresh:
+                        # nunique[i] >> nunique[j]: physical direction i→j
+                        # Suppress reverse edge j→i
+                        if W_masked[j, i] > threshold:
+                            W_masked[j, i] = 0.0
+                            cuts += 1
+                            logger.info(
+                                f"  [cardinality cut] {col_names[j]}->{col_names[i]} "
+                                f"suppressed  "
+                                f"(nunique {col_names[i]}={nunique[i]:.0f} >> "
+                                f"{col_names[j]}={nunique[j]:.0f}, "
+                                f"ratio={ratio:.1f})"
+                            )
+                    elif ratio < 1.0 / ratio_thresh:
+                        # nunique[j] >> nunique[i]: physical direction j→i
+                        # Suppress forward edge i→j
+                        if W_masked[i, j] > threshold:
+                            W_masked[i, j] = 0.0
+                            cuts += 1
+                            logger.info(
+                                f"  [cardinality cut] {col_names[i]}->{col_names[j]} "
+                                f"suppressed  "
+                                f"(nunique {col_names[j]}={nunique[j]:.0f} >> "
+                                f"{col_names[i]}={nunique[i]:.0f}, "
+                                f"ratio={1/ratio:.1f})"
+                            )
+                    # else: similar cardinality — keep both, resolve via SCC
+
+            logger.info(
+                f"Phase 2: cardinality masking suppressed {cuts} reverse edges"
+            )
+        else:
+            logger.info(
+                "Phase 2: cardinality masking skipped "
+                "(nunique_dict unavailable or ratio_threshold=inf)"
+            )
+
+        # ── Step 3: Build directed graph with masked active edges ──────────
         G = nx.DiGraph()
         G.add_nodes_from(range(m))
         for i in range(m):
             for j in range(m):
-                if i != j and W_pos[i, j] > 0:
-                    G.add_edge(i, j, weight=float(W_pos[i, j]))
+                if i != j and W_masked[i, j] > threshold:
+                    G.add_edge(i, j, weight=float(W_masked[i, j]))
 
-        log_W_statistics(self.W, self.columns or [], step=-1)
+        log_W_statistics(self.W, col_names, step=-1)
         logger.info(
             f"Phase 2: graph has {G.number_of_nodes()} nodes, "
-            f"{G.number_of_edges()} edges"
+            f"{G.number_of_edges()} edges after cardinality masking"
         )
 
-        # ── Maximum Spanning Arborescence (Edmonds) ────────────────────────
-        # nx.maximum_spanning_arborescence finds the branching that maximises
-        # total edge weight while being cycle-free (rooted arborescence).
-        root = min(self.arborescence_root, m - 1)
-        try:
-            arb = nx.maximum_spanning_arborescence(G)
-        except nx.exception.NetworkXException:
-            # Fallback: if graph is not strongly connected, use a heuristic
-            logger.warning(
-                "Phase 2: maximum_spanning_arborescence failed; "
-                "falling back to W row-sum ordering."
-            )
-            row_sums = W_pos.sum(axis=1)
-            optimal_order = list(np.argsort(row_sums)[::-1].tolist())
-            logger.info(f"Phase 2 fallback order: {optimal_order}")
-            return optimal_order
+        # ── Step 4: SCC condensation → DAG ────────────────────────────────
+        # Find SCCs; within each SCC sort by decreasing cardinality so that
+        # the highest-entropy feature is listed first inside the group.
+        raw_sccs = list(nx.strongly_connected_components(G))
 
-        # ── Topological sort on the arborescence ──────────────────────────
+        def _sort_scc(scc: tp.Set[int]) -> tp.List[int]:
+            nodes = list(scc)
+            if nunique is not None and len(nodes) > 1:
+                nodes.sort(key=lambda n: -nunique[n])
+            return nodes
+
+        sorted_sccs = [_sort_scc(s) for s in raw_sccs]
+
+        # nx.condensation requires scc as a list of sets
+        scc_sets = [set(s) for s in sorted_sccs]
+        C = nx.condensation(G, scc=scc_sets)
+        # C.nodes[k]['members'] is the set of original nodes in SCC k
+
+        # ── Step 5: Topological sort of condensed DAG ─────────────────────
         try:
-            topo = list(nx.topological_sort(arb))
+            topo_scc_ids = list(nx.topological_sort(C))
         except nx.exception.NetworkXUnfeasible:
-            # Should not happen for a DAG, but guard anyway
-            topo = list(arb.nodes())
+            logger.warning(
+                "Phase 2: topological sort on condensed DAG failed "
+                "(should be impossible); using SCC discovery order."
+            )
+            topo_scc_ids = list(range(len(raw_sccs)))
 
-        # Ensure all features are included (arborescence may drop isolated nodes)
-        in_topo = set(topo)
-        missing = [i for i in range(m) if i not in in_topo]
-        topo = topo + missing  # append isolated nodes at the end
+        # ── Step 6: Flatten SCCs → feature ordering ────────────────────────
+        # Each SCC in topo order; members already sorted by decreasing nunique.
+        optimal_order: tp.List[int] = []
+        for scc_id in topo_scc_ids:
+            members = sorted_sccs[scc_id]
+            optimal_order.extend(members)
 
-        logger.info(f"Phase 2: optimal feature order = {topo}")
-        return topo
+        # Safety: append any node missed due to graph isolation
+        in_order = set(optimal_order)
+        missing = [i for i in range(m) if i not in in_order]
+        if missing:
+            if nunique is not None:
+                missing.sort(key=lambda n: -nunique[n])
+            optimal_order.extend(missing)
+
+        logger.info(
+            f"Phase 2: optimal order = {optimal_order}\n"
+            "  Features: "
+            + " -> ".join(col_names[i] for i in optimal_order if i < len(col_names))
+        )
+        return optimal_order
 
     # ── Main fit() with 3-phase logic ─────────────────────────────────────
 
@@ -1199,11 +1352,33 @@ class IBSparseGReaT(GReaT):
               'W': Final W parameter tensor (detached, cpu)
         """
         df = _array_to_dataframe(data, columns=column_names)
+
+        # ── Atomic tokenisation plug-in (v0.2) ────────────────────────────────
+        # Must run BEFORE _update_column_information so GReaT's internal
+        # column-value metadata reflects the atomised representation.
+        # After fit_transform the tokenizer has new special tokens; the model
+        # embedding matrix is resized here so all three phases see consistent
+        # dimensions.
+        if self.atomizer is not None:
+            df = self.atomizer.fit_transform(df, self.tokenizer)
+            self.model.resize_token_embeddings(len(self.tokenizer))
+            logger.info(
+                f"[AtomicTokenizer] vocab expanded to {len(self.tokenizer)} "
+                f"(+{self.atomizer.n_new_tokens} atomic tokens)"
+            )
+
         self._update_column_information(df)
         self._update_conditional_information(df, conditional_col)
 
         m = len(self.columns)
         logger.info(f"IBSparseGReaT.fit(): {m} features, {len(df)} samples")
+
+        # ── Compute cardinality (nunique) for Phase 2 direction enforcement ──
+        self.nunique_dict = {col: int(df[col].nunique()) for col in df.columns}
+        logger.info(
+            "Feature cardinality: "
+            + ", ".join(f"{c}={v}" for c, v in self.nunique_dict.items())
+        )
 
         # ── Initialise W matrix ───────────────────────────────────────────
         self._init_W(m)
@@ -1279,8 +1454,6 @@ class IBSparseGReaT(GReaT):
         Returns:
             The IBSparseTrainer instance after training.
         """
-        import os
-
         phase_dir = os.path.join(self.experiment_dir, phase_name)
         m = len(self.columns)
 
@@ -1355,38 +1528,57 @@ class IBSparseGReaT(GReaT):
         conditions: tp.Optional[tp.Dict[str, str]] = None,
     ) -> pd.DataFrame:
         """Generate samples.  If Phase 2 has been run, use optimal_order."""
-        # If we have a stable order from Phase 2, use it in guided sampling
+        # Capture original column order before any temporary reordering.
+        # Initialised to None so the finally block is a no-op when optimal_order
+        # is not set (avoids unbound-variable risk).
+        original_columns = None
+
         if self.optimal_order is not None:
             logger.info(
                 "Sampling with optimal feature order from Phase 2. "
                 "Setting random_feature_order=False."
             )
             random_feature_order = False
-            # Reorder columns to optimal_order for guided sampling
+            # Temporarily reorder self.columns so that GReaT's guided sampler
+            # generates features in the IB-optimal sequence.
             if self.columns is not None:
                 original_columns = list(self.columns)
                 self.columns = [original_columns[i] for i in self.optimal_order]
 
-        result = super().sample(
-            n_samples=n_samples,
-            start_col=start_col,
-            start_col_dist=start_col_dist,
-            temperature=temperature,
-            k=k,
-            max_length=max_length,
-            drop_nan=drop_nan,
-            device=device,
-            guided_sampling=guided_sampling,
-            random_feature_order=random_feature_order,
-            conditions=conditions,
-        )
+        try:
+            result = super().sample(
+                n_samples=n_samples,
+                start_col=start_col,
+                start_col_dist=start_col_dist,
+                temperature=temperature,
+                k=k,
+                max_length=max_length,
+                drop_nan=drop_nan,
+                device=device,
+                guided_sampling=guided_sampling,
+                random_feature_order=random_feature_order,
+                conditions=conditions,
+            )
+        finally:
+            # Always restore self.columns, even if super().sample() raises.
+            # Without this, a failed generation call would leave the model in
+            # an inconsistent state where the next sample() call fails.
+            if original_columns is not None:
+                self.columns = original_columns
 
-        # Restore original column order
-        if self.optimal_order is not None and self.columns is not None:
+        # Restore result DataFrame column order to match training data layout.
+        if original_columns is not None:
             try:
                 result = result[original_columns]
-            except (KeyError, NameError):
+            except KeyError:
                 pass
+
+        # ── Inverse atomic tokenisation plug-in (v0.2) ───────────────────────
+        # Replace atomic token strings (e.g. ATM_bird_3) back to original
+        # categorical values (e.g. "California Quail") in the output DataFrame.
+        # Unknown/hallucinated atomic tokens are left as-is for inspection.
+        if self.atomizer is not None:
+            result = self.atomizer.inverse_transform(result)
 
         return result
 

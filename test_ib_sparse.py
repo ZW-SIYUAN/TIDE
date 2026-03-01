@@ -190,4 +190,77 @@ try:
 except Exception as e:
     fail("Monitoring utilities failed", e)
 
+# ─── 8. CategoricalAtomizer (v0.2 plug-in) ───────────────────────────────────
+print("\n[8] CategoricalAtomizer (v0.2) …")
+try:
+    import tempfile, os
+    from atomic_tokenizer import CategoricalAtomizer, diagnose
+
+    # Minimal DataFrame with multi-token categorical values
+    df_atm = pd.DataFrame({
+        "bird":       ["Northern Cardinal", "Northern Mockingbird", "American Robin",
+                       "Northern Cardinal", "American Robin"],
+        "state_code": ["OH", "IN", "PA", "VA", "OH"],
+        "lat":        [40.1, 39.8, 40.2, 37.5, 40.1],
+    })
+
+    atm = CategoricalAtomizer(cat_cols=["bird", "state_code"], min_tokens=2, verbose=False)
+    df_transformed = atm.fit_transform(df_atm, tokenizer)
+
+    # All bird values should be replaced by ATM_* tokens
+    assert atm.fitted, "atomizer should be fitted"
+    assert atm.n_new_tokens > 0, "should have registered new tokens"
+
+    original_birds = set(df_atm["bird"].unique())
+    transformed_birds = set(df_transformed["bird"].unique())
+    assert not any(b in transformed_birds for b in original_birds), (
+        f"original values still present after transform: {transformed_birds & original_birds}"
+    )
+    assert all(v.startswith("ATM_") for v in transformed_birds), (
+        f"transformed values should all be ATM_* tokens: {transformed_birds}"
+    )
+
+    # Inverse transform should restore original values
+    df_restored = atm.inverse_transform(df_transformed)
+    assert set(df_restored["bird"].unique()) == original_birds, (
+        "inverse_transform did not restore all original bird values"
+    )
+
+    # save / load round-trip
+    with tempfile.TemporaryDirectory() as tmp:
+        save_path = os.path.join(tmp, "atm.json")
+        atm.save(save_path)
+        atm2 = CategoricalAtomizer.load(save_path)
+        df_restored2 = atm2.inverse_transform(df_transformed)
+        assert list(df_restored2["bird"]) == list(df_restored["bird"]), (
+            "save/load round-trip changed inverse_transform result"
+        )
+
+    ok(
+        f"CategoricalAtomizer: {atm.n_new_tokens} new tokens, "
+        f"transform/inverse/save/load all correct"
+    )
+except Exception as e:
+    fail("CategoricalAtomizer failed", e)
+
+# ─── 9. IBSparseGReaT + atomizer instantiation ────────────────────────────────
+print("\n[9] IBSparseGReaT with atomizer=CategoricalAtomizer …")
+try:
+    from atomic_tokenizer import CategoricalAtomizer as CA
+    atm9 = CA(cat_cols=["city"], verbose=False)
+    ib9 = IBSparseGReaT(
+        llm="distilgpt2",
+        atomizer=atm9,
+        beta_ib=0.1,
+        phase1_epochs=1,
+        phase3_epochs=1,
+        batch_size=2,
+        experiment_dir="test_ib_great_output_v2",
+    )
+    assert ib9.atomizer is atm9, "atomizer not stored correctly"
+    assert not atm9.fitted, "atomizer should not be fitted yet (fit() not called)"
+    ok("IBSparseGReaT(atomizer=...) instantiated; atomizer stored, not yet fitted")
+except Exception as e:
+    fail("IBSparseGReaT + atomizer instantiation failed", e)
+
 print(f"\n{GREEN}All tests passed!{RESET}\n")
